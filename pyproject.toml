@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "typing-simulator"
+version = "0.1.0"
+description = "Local Typing Input Simulator - a macOS-first prototype that replays pasted text as individual keyboard events."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Local Typing Input Simulator contributors" }]
+
+dependencies = [
+    "PySide6>=6.6",
+    "pynput>=1.7.6",
+    # AppKit/NSWorkspace for the focus guard and the global hotkey monitors.
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    # Quartz/CGEvent for the macOS keyboard backend, and the CGPreflight*
+    # permission probes behind the Input Monitoring gate.
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    # AXIsProcessTrustedWithOptions (the permission prompt) and the caret
+    # guard's Accessibility queries.  Previously present only because pynput
+    # happened to pull it in.
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+build = [
+    "pyinstaller>=6.3",
+]
+
+[project.scripts]
+typing-simulator = "typing_simulator.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
