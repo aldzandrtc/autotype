@@ -1,7 +1,10 @@
 # Local Typing Input Simulator
 #
 #   make setup   one-time: create the virtualenv and install everything
-#   make run     run the overlay from source
+#   make dev     build and open the development app - the one to use while
+#                working on this, because macOS can actually grant it
+#                permission and the grant survives your edits
+#   make run     run the overlay straight from source (see the warning below)
 #   make test    run the automated test suite
 #   make app     build a double-clickable "Typing Simulator.app"
 #   make install build the app and copy it into /Applications
@@ -23,12 +26,18 @@ SPEC       := packaging/TypingSimulator.spec
 # Must match `bundle_identifier` in $(SPEC); it is how tccutil names the app.
 BUNDLE_ID  := local.typing-simulator
 
+DEV_APP_NAME := Typing Simulator (dev)
+DEV_APP      := dist/$(DEV_APP_NAME).app
+# Must match BUNDLE_ID in packaging/dev_bundle.py.
+DEV_BUNDLE_ID := local.typing-simulator.dev
+
 # Python 3.11+ is required; override with `make PYTHON=/path/to/python3.12 setup`.
 PYTHON ?= $(shell command -v python3.13 || command -v python3.12 || \
                   command -v python3.11 || command -v python3)
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run test app install reset-permissions clean distclean check
+.PHONY: help setup dev dev-app run test app install reset-permissions \
+        reset-dev-permissions clean distclean check
 
 help: ## Show this help
 	@echo "Local Typing Input Simulator"
@@ -36,7 +45,7 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[1m%-10s\033[0m %s\n", $$1, $$2}'
 	@echo
-	@echo "First time:  make setup && make run"
+	@echo "First time:  make setup && make dev"
 
 $(PY):
 	@echo "==> Creating the virtualenv with $(PYTHON)"
@@ -49,10 +58,38 @@ setup: $(PY) ## Create the virtualenv and install the app and its dev tools
 	@echo "==> Installing dependencies"
 	$(PIP) install --quiet -e ".[dev]"
 	@echo
-	@echo "Done. Run it with:  make run"
-	@echo "macOS will ask for Accessibility permission the first time you type."
+	@echo "Done. Run it with:  make dev"
+	@echo "macOS will ask for Accessibility permission the first time it starts."
 
-run: setup ## Run the overlay from source
+# Why there is a development bundle at all
+# ---------------------------------------
+# macOS grants Accessibility to the *running executable*. Run from source that
+# executable is the virtualenv's interpreter - a symlink to a Homebrew Python
+# shared with everything else on the machine, which macOS additionally
+# attributes to whichever terminal launched it. There is no way to grant that
+# combination permission and have it mean this application.
+#
+# This bundle's executable is a copy of the interpreter placed *inside* the
+# bundle, so the grant is made to the bundle. The source stays outside it and
+# is reached through PYTHONPATH, so editing code does not change the bundle's
+# contents - and an ad-hoc signature is a hash of exactly those contents. Grant
+# it once and it stays granted, however many times you edit and relaunch.
+dev-app: setup ## Build the development app bundle (about a second)
+	@echo "==> Building $(DEV_APP_NAME).app"
+	@$(PY) packaging/dev_bundle.py --dist dist --source src
+
+dev: dev-app ## Build and open the development app
+	@echo "==> Opening $(DEV_APP_NAME).app"
+	@open "$(DEV_APP)"
+	@echo
+	@echo "Logs:  ~/Library/Logs/Typing Simulator/typing-simulator.log"
+	@echo "If permission is refused and asking does nothing, run:"
+	@echo "  make reset-dev-permissions"
+
+run: setup ## Run the overlay straight from source (cannot hold a permission grant)
+	@echo "Note: run from source, macOS attributes Accessibility to the"
+	@echo "      interpreter and to the terminal that launched it, not to this"
+	@echo "      application. Use 'make dev' if you need it to actually type."
 	$(PY) -m typing_simulator
 
 test: setup ## Run the automated test suite
@@ -89,6 +126,17 @@ reset-permissions: ## Clear stale macOS permission entries for the app
 	@tccutil reset Accessibility $(BUNDLE_ID) >/dev/null 2>&1 || true
 	@tccutil reset PostEvent $(BUNDLE_ID) >/dev/null 2>&1 || true
 	@tccutil reset ListenEvent $(BUNDLE_ID) >/dev/null 2>&1 || true
+	@echo "    Grant permission again on the next launch."
+
+# The development bundle does not normally need this - its identity survives
+# source edits - but it does after the checkout moves, or if the prompt was
+# dismissed once and macOS therefore stopped showing it. The app's own
+# "Grant permission" button does exactly this when nothing is granted yet.
+reset-dev-permissions: ## Clear macOS permission entries for the development app
+	@echo "==> Clearing permission entries for $(DEV_BUNDLE_ID)"
+	@tccutil reset Accessibility $(DEV_BUNDLE_ID) >/dev/null 2>&1 || true
+	@tccutil reset PostEvent $(DEV_BUNDLE_ID) >/dev/null 2>&1 || true
+	@tccutil reset ListenEvent $(DEV_BUNDLE_ID) >/dev/null 2>&1 || true
 	@echo "    Grant permission again on the next launch."
 
 install: app ## Build the app and copy it into /Applications

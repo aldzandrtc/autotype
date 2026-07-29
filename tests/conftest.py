@@ -7,10 +7,16 @@ and fake focus / hotkey services.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# Qt must never open a real window during the suite, and the native overlay
+# configuration is deliberately inert off the Cocoa plugin.  Set before any
+# test module imports PySide6, which is why it lives here.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Allow running the suite straight from a checkout, without installing.
 SRC = Path(__file__).resolve().parents[1] / "src"

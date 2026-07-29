@@ -64,8 +64,14 @@ def _add_file_handler_when_bundled(level: int) -> None:
     the failures worth diagnosing - a permission that is granted but not in
     effect, focus never settling on the target - are the silent ones, and the
     log is the only place they are visible at all.
+
+    The test is "am I inside a bundle", not ``sys.frozen``: the development
+    bundle is an ordinary interpreter and has no terminal either, and it is the
+    build most likely to be diagnosing something.
     """
-    if not getattr(sys, "frozen", False):
+    from typing_simulator.safety.permissions import _own_bundle_path
+
+    if not getattr(sys, "frozen", False) and _own_bundle_path() is None:
         return
     try:
         from logging.handlers import RotatingFileHandler

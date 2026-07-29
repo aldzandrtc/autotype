@@ -32,6 +32,7 @@ from typing import Callable, Protocol, runtime_checkable
 from typing_simulator import config
 from typing_simulator.errors import HotkeyError, MissingPermissionError
 from typing_simulator.safety.permissions import (
+    accessibility_permission_granted,
     input_monitoring_permission_granted,
     permission_holder_name,
 )
@@ -44,6 +45,13 @@ _START_TIMEOUT_SECONDS = 3.0
 
 @runtime_checkable
 class HotkeyService(Protocol):
+    #: Whether this implementation needs ``kTCCServiceListenEvent``.  Which
+    #: permission actually gates a global hotkey depends entirely on how it is
+    #: implemented, so each implementation says so rather than the caller
+    #: guessing - guessing is what refused to type over a permission that was
+    #: never needed.
+    requires_input_monitoring: bool
+
     def start(self) -> None:
         """Start the listener, or raise if it cannot be verified as running."""
         ...
@@ -68,21 +76,44 @@ _VK_ESCAPE = 53
 _VK_P = 35
 
 
-def _require_input_monitoring() -> None:
-    """Refuse to claim the hotkeys are live when macOS will not deliver them.
+def _require_accessibility_for_monitors() -> None:
+    """The gate for ``NSEvent`` global monitors, which is *Accessibility*.
 
     This is what makes the fail-closed promise real.  Installing a global
-    monitor *succeeds* without Input Monitoring permission -
+    monitor *succeeds* whatever the permissions say -
     ``addGlobalMonitorForEventsMatchingMask_handler_`` hands back a perfectly
     valid token - and the handler is then simply never called.  Checking only
     the return value therefore reports working hotkeys while the abort shortcut
     is dead, which is the one failure this application must never have: the
     user would be mid-run with no way to stop it from another application.
 
-    Input Monitoring is its own switch in System Settings.  Enabling
-    Accessibility does not enable it, so the message names it specifically -
-    telling someone to grant a permission they already granted is exactly how
-    this gets diagnosed as "it says permission is missing but it isn't".
+    The permission to check is Accessibility, not Input Monitoring.  Apple
+    documents key-event global monitors as requiring the process to be trusted
+    for accessibility; ``kTCCServiceListenEvent`` gates ``CGEventTap``, which
+    this implementation does not use.  Preflighting Input Monitoring here
+    refuses to type over a permission the hotkeys never needed - and, because
+    that preflight answers from process start-up and never updates, refuses
+    even after the user has granted it.
+    """
+    if accessibility_permission_granted() is not False:
+        return
+    raise MissingPermissionError(
+        "The global pause and abort hotkeys need Accessibility permission, "
+        "which macOS has not granted, so they would never fire. Enable "
+        f"{permission_holder_name()} under System Settings → Privacy & "
+        "Security → Accessibility. Typing is refused until "
+        f"{config.HOTKEY_ABORT_LABEL} can actually stop it."
+    )
+
+
+def _require_input_monitoring() -> None:
+    """The gate for ``CGEventTap`` listeners, which is *Input Monitoring*.
+
+    Used by the ``pynput`` fallback only.  Input Monitoring is its own switch
+    in System Settings and Accessibility does not imply it, so the message
+    names it specifically - telling someone to grant a permission they already
+    granted is exactly how this gets diagnosed as "it says permission is
+    missing but it isn't".
     """
     if input_monitoring_permission_granted() is not False:
         return
@@ -113,6 +144,9 @@ class NSEventHotkeyService:
     :meth:`start` must be called from the main thread.
     """
 
+    #: ``NSEvent`` monitors are gated by Accessibility, not Input Monitoring.
+    requires_input_monitoring = False
+
     def __init__(
         self,
         on_pause_resume: Callable[[], None],
@@ -132,7 +166,7 @@ class NSEventHotkeyService:
         with self._lock:
             if self._monitors:
                 return
-            _require_input_monitoring()
+            _require_accessibility_for_monitors()
             try:
                 from AppKit import NSEvent
             except Exception as exc:  # noqa: BLE001
@@ -227,6 +261,9 @@ class PynputHotkeyService:
        :class:`NSEventHotkeyService` instead.
     """
 
+    #: ``pynput`` installs a ``CGEventTap``, which Input Monitoring gates.
+    requires_input_monitoring = True
+
     def __init__(
         self,
         on_pause_resume: Callable[[], None],
@@ -247,6 +284,7 @@ class PynputHotkeyService:
         with self._lock:
             if self.is_active:
                 return
+            _require_input_monitoring()
             try:
                 from pynput import keyboard
             except Exception as exc:  # noqa: BLE001

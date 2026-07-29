@@ -44,11 +44,17 @@ from typing_simulator.errors import MissingPermissionError
 from typing_simulator.safety.caret_guard import CaretGuard, CaretSnapshot, create_caret_guard
 from typing_simulator.safety.focus_guard import FocusGuard, FrontmostApp
 from typing_simulator.safety.permissions import (
+    RESTART_AFTER_RESET,
+    RESTART_TO_APPLY,
     PermissionStatus,
+    can_reset_permissions,
     describe_permission_remedy,
     permission_status,
+    relaunch,
     request_accessibility_permission,
     request_input_monitoring_permission,
+    request_post_event_permission,
+    reset_permissions,
     typing_permission_granted,
 )
 from typing_simulator.safety.hotkeys import HotkeyService
@@ -411,16 +417,101 @@ class SafetyController:
         Accessibility is requested first when key events cannot be delivered.
         Once that gate is open, Input Monitoring is requested if the global
         stop hotkeys would otherwise be unavailable.
+
+        Post Events is requested alongside Accessibility whenever it is the
+        service that is actually denied.  It has its own request call, and
+        without it there is a state with no way out: a process that is already
+        trusted for Accessibility gets ``True`` back from
+        ``AXIsProcessTrustedWithOptions`` without any prompt at all, so nothing
+        ever asks about the service that is refusing.
         """
         status = self.permission_status()
-        if status.can_type is not False and status.input_monitoring is False:
+        if (
+            status.can_type is not False
+            and status.input_monitoring is False
+            and self.hotkeys_require_input_monitoring
+        ):
+            # Only asked for when the hotkey implementation in use is actually
+            # gated by it.  On macOS the monitors run on Accessibility, so
+            # prompting here would put a dialog for a permission this build
+            # never needs in front of the user - and leave a red row behind
+            # when they decline it.
             granted = request_input_monitoring_permission()
             logger.info("Requested Input Monitoring permission; granted=%s", granted)
             return granted
 
         granted = request_accessibility_permission()
         logger.info("Requested Accessibility permission; granted=%s", granted)
+        if status.post_events is False:
+            posting = request_post_event_permission()
+            logger.info("Requested Post Events permission; granted=%s", posting)
+            if granted is not False:
+                granted = posting
         return granted
+
+    @property
+    def hotkeys_require_input_monitoring(self) -> bool:
+        """Whether the hotkey implementation in use is gated by Input Monitoring.
+
+        Only the ``CGEventTap``-based fallback is.  The ``NSEvent`` monitors
+        this runs on macOS are gated by Accessibility, so refusing to type
+        without Input Monitoring would refuse over a permission that has no
+        bearing on whether the abort hotkey works.
+        """
+        return bool(getattr(self._hotkeys, "requires_input_monitoring", True))
+
+    @staticmethod
+    def can_reset_permissions() -> bool:
+        """Whether this build can clear its own TCC entries."""
+        return can_reset_permissions()
+
+    def restart_to_apply_permission(self) -> bool:
+        """Restart to pick up a grant, **without** clearing anything.
+
+        Kept firmly apart from :meth:`restart_for_permission`, because the two
+        situations look identical in the interface and the wrong one is
+        destructive: this runs when the user has just granted the permission,
+        and clearing the entry here would delete exactly what they granted.
+        """
+        logger.info("Restarting to pick up a permission granted since start-up.")
+        return relaunch(RESTART_TO_APPLY)
+
+    def restart_for_permission(self) -> bool:
+        """Clear our own grants and start again, so macOS asks properly.
+
+        The two steps only work together, which is what makes this one method
+        rather than two.  Clearing an entry does nothing visible while the
+        process that cleared it is still running: macOS fixes a process's
+        answer the first time it asks and keeps it, and shows its prompt at
+        most once per process.  Restarting without clearing is equally useless
+        when the entry is the problem.  Doing both is what turns "the button
+        does nothing" into a prompt on screen.
+
+        Nothing is cleared while any of the services still reads as granted.
+        Clearing only exists to get a prompt back, and a permission that is
+        currently in force does not need one - throwing it away to ask for it
+        again would destroy the thing the user came here to obtain.  The
+        restart still happens, because a stale start-up answer needs a fresh
+        process either way.
+
+        Returns whether the restart was scheduled; the caller closes the
+        window.
+        """
+        status = self.permission_status()
+        if True in (status.accessibility, status.post_events, status.input_monitoring):
+            logger.info(
+                "Not clearing any permission entry: at least one is granted "
+                "(accessibility=%s post_events=%s input_monitoring=%s); "
+                "restarting only.",
+                status.accessibility,
+                status.post_events,
+                status.input_monitoring,
+            )
+            return relaunch(RESTART_TO_APPLY)
+
+        cleared = reset_permissions()
+        logger.info("Cleared this application's permission entries; cleared=%s", cleared)
+        return relaunch(RESTART_AFTER_RESET)
 
     def current_frontmost(self) -> FrontmostApp | None:
         """The frontmost application right now, for the overlay's live preview.

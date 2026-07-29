@@ -55,7 +55,13 @@ from typing_simulator.config import TypingSettings, VariationLevel
 from typing_simulator.domain.state import AppState
 from typing_simulator.errors import TypingSimulatorError
 from typing_simulator.safety.controller import SafetyController, TargetApplication
-from typing_simulator.safety.permissions import PermissionStatus, describe_permission_remedy
+from typing_simulator.safety.permissions import (
+    GRANT_BUTTON_LABEL,
+    PermissionStatus,
+    clear_restart_marker,
+    describe_permission_remedy,
+    was_restarted_to_apply_permission,
+)
 from typing_simulator.scheduler.scheduler import Progress, RunResult, RunStatus
 from typing_simulator.ui import theme
 from typing_simulator.ui.worker import ControllerBridge
@@ -95,6 +101,15 @@ INPUT_MONITORING_SETTINGS_URL = (
 #: banner clearing itself is what tells the user it worked - waiting for them to
 #: find a "Re-check" button makes a granted permission look like it failed.
 PERMISSION_POLL_INTERVAL_MS = 1500
+
+#: Mark and tone for each state a single permission can be in.  "?" is not a
+#: failure: off macOS, and on macOS versions without a preflight call, the
+#: honest answer is that it cannot be read.
+PERMISSION_MARKS: dict[bool | None, tuple[str, str]] = {
+    True: ("✓", "ok"),
+    False: ("✕", "bad"),
+    None: ("?", "muted"),
+}
 
 #: Dot shown next to the state name in the header pill.
 STATE_TONES: dict[AppState, str] = {
@@ -168,6 +183,16 @@ class OverlayWindow(QWidget):
         self._permission_granted = permission_granted
         self._permission_status: PermissionStatus | None = None
         self._hotkeys_blocked = False
+        #: macOS grants one permission dialog per process.  Once it is used,
+        #: only a restart can produce another - see _on_request_permission.
+        self._permission_prompt_spent = False
+        #: A restart picks up a grant made since start-up, but only once: if it
+        #: did not help, the permission really is missing.
+        self._restart_attempted = False
+        #: True once a restart has actually been scheduled.  The banner has to
+        #: know: promising "restarting to pick it up" when nothing is going to
+        #: restart is worse than saying nothing at all.
+        self._restart_pending = False
         self._settings_url = ACCESSIBILITY_SETTINGS_URL
         self._text_is_valid = False
         self._should_be_visible = False
@@ -275,31 +300,87 @@ class OverlayWindow(QWidget):
         set_tone(self.banner_label, "warn")
         layout.addWidget(self.banner_label)
 
+        layout.addWidget(self._build_permission_checklist())
+
         row = QHBoxLayout()
         row.setSpacing(6)
-        # Listed first because it is the one that usually works.  Reading the
-        # permission never registers this process with macOS, so an entry added
-        # by hand can stop matching the binary; asking macOS to prompt
-        # re-registers the running identity and makes the switch take effect.
-        self.request_button = QPushButton("Request permission")
+        # One button, not two.  Whether asking macOS is enough, or the entry
+        # has to be cleared and the application restarted first, is a fact
+        # about TCC's internals - the user should press "grant it" and have the
+        # application work out which of those is needed.
+        self.request_button = QPushButton(GRANT_BUTTON_LABEL)
         self.request_button.setObjectName("chip")
         self.request_button.setToolTip(
-            "Ask macOS for the permission named in this banner. Use this first: "
-            "it registers this exact build with the system, which an entry "
-            "added by hand may no longer match."
+            "Ask macOS for whatever is missing above.\n\n"
+            "macOS shows its prompt at most once per launch and decides what "
+            "this application may do when it starts, so if it has already "
+            "stopped asking, this clears this application's own permission "
+            "entries and restarts it - which is what makes the prompt appear "
+            "again. No other application's entries are touched, and nothing "
+            "is cleared while a permission still reads as granted."
         )
         self.open_settings_button = QPushButton("Open settings")
         self.open_settings_button.setObjectName("chip")
         self.recheck_button = QPushButton("Re-check")
         self.recheck_button.setObjectName("chip")
-        row.addWidget(self.request_button)
-        row.addWidget(self.open_settings_button)
-        row.addWidget(self.recheck_button)
+        for button in (
+            self.request_button,
+            self.open_settings_button,
+            self.recheck_button,
+        ):
+            # Chips are laid out by their text, and a fixed-width panel gives
+            # them no room to be clipped into.
+            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            row.addWidget(button)
         row.addStretch(1)
         layout.addLayout(row)
 
         self._banner.hide()
         return self._banner
+
+    def _build_permission_checklist(self) -> QWidget:
+        """A row of "Accessibility ✓  Post events ✕  Input Monitoring ✕".
+
+        Which switch is off has to be readable at a glance.  A paragraph that
+        happens to mention Accessibility reads as "Accessibility is off" to
+        someone who has just turned it on, and they then conclude the
+        application is broken rather than that a second, separate switch is
+        still off.
+        """
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        self._permission_marks: list[QLabel] = []
+        for _ in range(3):
+            label = QLabel()
+            set_tone(label, "muted")
+            row.addWidget(label)
+            self._permission_marks.append(label)
+        row.addStretch(1)
+        return host
+
+    def _update_permission_checklist(self, status: PermissionStatus) -> None:
+        """Mark each permission, and never in red one that is not needed.
+
+        Input Monitoring is the awkward row.  On macOS the hotkeys run on
+        ``NSEvent`` monitors, which it does not gate, so it is reported purely
+        for information - and a red ✕ next to it says "still broken" to
+        someone whose permissions are in fact complete, which is precisely the
+        wrong thing to say to a user who has just granted everything asked of
+        them.
+        """
+        required = (True, True, self._controller.hotkeys_require_input_monitoring)
+        for label, (name, granted), needed in zip(
+            self._permission_marks, status.checklist(), required, strict=True
+        ):
+            if not needed and granted is not True:
+                label.setText(f"–  {name} (not needed)")
+                set_tone(label, "muted")
+                continue
+            mark, tone = PERMISSION_MARKS[granted]
+            label.setText(f"{mark}  {name}")
+            set_tone(label, tone)
 
     def _build_target_row(self) -> QWidget:
         row = QWidget()
@@ -489,7 +570,11 @@ class OverlayWindow(QWidget):
         self.pause_button.clicked.connect(self._on_pause_resume)
         self.abort_button.clicked.connect(self._on_abort)
         self.reset_button.clicked.connect(self._on_reset)
-        self.collapse_button.clicked.connect(self.toggle_collapsed)
+        # Not connected directly: `clicked` carries a `checked` argument, which
+        # a slot with an optional parameter silently receives - so the button
+        # asked to *expand* every time instead of toggling, and the panel could
+        # never be collapsed at all.
+        self.collapse_button.clicked.connect(lambda: self.toggle_collapsed())
         self.close_button.clicked.connect(self.close)
         self.recheck_button.clicked.connect(self._on_recheck_permission)
         self.request_button.clicked.connect(self._on_request_permission)
@@ -549,13 +634,31 @@ class OverlayWindow(QWidget):
         status = self._controller.permission_status()
         self._permission_status = status
         self._permission_granted = self._controller.check_permission()
-        # Input Monitoring gates the abort hotkey, and typing is refused
-        # without a working abort - so it blocks Start just as hard.
-        self._hotkeys_blocked = status.input_monitoring is False
+        # Typing is refused without a working abort hotkey - but only the
+        # permission the hotkeys actually use can block it.  On macOS they run
+        # on NSEvent monitors, which Accessibility gates; Input Monitoring is
+        # then reported for information and never stops a run.
+        self._hotkeys_blocked = (
+            self._controller.hotkeys_require_input_monitoring
+            and status.input_monitoring is False
+        )
+        self._update_permission_checklist(status)
+        if status.can_type is not False:
+            # The restart chain, if there was one, has done its job.  Leaving
+            # the marker set would silently forbid the *next* restart-to-apply,
+            # for no reason other than that an earlier one succeeded.
+            clear_restart_marker()
+        self._restart_if_the_grant_has_landed(status)
 
         message = self._permission_message(status)
         if message:
             self.banner_label.setText(message)
+            # The full explanation is a paragraph, and a paragraph of warning
+            # colour reads as a catastrophe.  One line in the banner, the
+            # detail on hover.
+            self.banner_label.setToolTip(
+                describe_permission_remedy(status, restart_pending=self._restart_pending)
+            )
             self._banner.show()
             self._start_permission_polling()
         else:
@@ -570,32 +673,83 @@ class OverlayWindow(QWidget):
         self._apply_state(self._controller.state)
         self.adjustSize()
 
-    def _permission_message(self, status: PermissionStatus) -> str:
-        """The banner text, or ``""`` when there is nothing to warn about.
+    def _restart_if_the_grant_has_landed(self, status: PermissionStatus) -> None:
+        """Pick up a permission granted while this was already running.
 
-        The symptom is stated before the remedy, and the two permissions are
-        never merged into one sentence: telling someone to enable Accessibility
-        when Accessibility is already on is exactly how a missing Input
-        Monitoring grant gets misread as a broken application.
+        The user grants it in the dialog, watches one line go green and the
+        other two stay red, and reasonably concludes it is broken - when in
+        fact everything is granted and this process is simply still quoting the
+        answer it was given at start-up.  Restarting is the only way to see the
+        real one, so it happens by itself rather than being explained.
+
+        Done at most once per chain, and only when the permission is actually
+        there.  A restart loop in front of someone who can see it looping is a
+        worse failure than the one it is fixing.
+
+        The loop guard keys on whether the *previous restart was this same
+        restart*, not on whether we restarted at all.  Those are different
+        questions, and answering the second one was the bug: pressing
+        "Grant permission" clears the entries and restarts, so the very next
+        thing that happens - the user granting the permission macOS has just
+        asked them for - found the one allowance already spent, and sat there
+        showing "Accessibility ✓, Post events ✕" until the user pressed the
+        button a second time.
         """
-        remedy = describe_permission_remedy(status)
-        if self._permission_granted is False:
-            symptom = (
-                "Key events would be silently discarded, so nothing would be "
-                "typed."
-            )
-            if status.stale_grant_suspected:
-                symptom = (
-                    "Permission is switched on but is not in effect for this "
-                    "build, so nothing would be typed."
+        if not status.needs_restart_to_apply or self._closing:
+            return
+        if was_restarted_to_apply_permission() or self._restart_attempted:
+            # Restarting for exactly this already happened and changed nothing,
+            # so the answer is real: the permission genuinely is not granted.
+            return
+        self._restart_attempted = True
+        logger.info(
+            "Accessibility is granted but the preflight answers are from "
+            "start-up; restarting to pick them up."
+        )
+        self._set_status("Permission granted. Restarting to pick it up…")
+        self._restart(self._controller.restart_to_apply_permission)
+
+    def _permission_message(self, status: PermissionStatus) -> str:
+        """The banner headline, or ``""`` when there is nothing to warn about.
+
+        One line.  This is a switch that needs turning on, not a disaster, and
+        four lines of warning-coloured prose says the opposite - it makes a
+        two-click fix look like a broken application.  The checklist underneath
+        says which permission, the button says what to do about it, and the
+        full explanation is on hover for anyone who wants it.
+
+        The permissions are still never merged into one sentence: telling
+        someone to enable Accessibility when Accessibility is already on is
+        exactly how a missing Input Monitoring grant gets misread.
+        """
+        if status.needs_restart_to_apply:
+            if self._restart_pending:
+                return (
+                    "Permission is granted — restarting to pick it up. If "
+                    f"nothing happens, press {GRANT_BUTTON_LABEL}."
                 )
-            return f"{symptom} {remedy}"
+            # Nothing is going to restart on its own, so say what will work.
+            # Announcing a restart that never comes is how a granted
+            # permission ends up looking like a broken application.
+            return (
+                "Permission is granted, but this run cannot see it yet. Press "
+                f"{GRANT_BUTTON_LABEL} to restart and pick it up."
+            )
+        if self._permission_granted is False:
+            if status.stale_grant_suspected:
+                return (
+                    "Permission is switched on but not in effect for this "
+                    f"build. Press {GRANT_BUTTON_LABEL}."
+                )
+            return (
+                f"macOS has not granted {self._denied_typing_gates()} yet, so "
+                f"nothing would be typed. Press {GRANT_BUTTON_LABEL}."
+            )
         if self._hotkeys_blocked:
             return (
-                f"{config.HOTKEY_PAUSE_RESUME_LABEL} and "
-                f"{config.HOTKEY_ABORT_LABEL} would never fire, so a run could "
-                "not be stopped from another application. Typing is refused "
-                f"until they work. {remedy}"
+                "Input Monitoring is off, so "
+                f"{config.HOTKEY_ABORT_LABEL} could not stop a run. Press "
+                f"{GRANT_BUTTON_LABEL}."
             )
         return ""
 
@@ -629,23 +783,84 @@ class OverlayWindow(QWidget):
             else "Accessibility"
         )
         logger.info("%s permission is missing; asking macOS to prompt.", permission)
-        self._on_request_permission()
+        self._ask_macos_once()
 
     def _on_recheck_permission(self) -> None:
         self._refresh_permission_banner()
 
     def _on_request_permission(self) -> None:
-        """Ask macOS itself for the permission named in the current banner.
+        """Get the user a permission prompt, whatever that currently takes.
 
-        macOS shows the prompt at most once per identity, so a second press can
-        look like it did nothing.  The re-probe afterwards is what makes the
-        outcome visible either way.
+        Asking is only useful once.  macOS decides what a process may do the
+        first time it asks and keeps that answer for the life of the process,
+        and ``AXIsProcessTrustedWithOptions`` shows its dialog at most once per
+        process - so a second press cannot produce a prompt however the code is
+        written, which is exactly why a plain "request" button looks broken.
+
+        So this asks the first time, and after that does the only thing that
+        can still work: clear this application's own entries and restart it,
+        which is a fresh process with nothing recorded against it and therefore
+        a real prompt.  Clearing is skipped when a permission still reads as
+        granted - see
+        :meth:`~typing_simulator.safety.controller.SafetyController.restart_for_permission`.
         """
+        if self._needs_restart_to_apply():
+            # Granted already - restart to see it, and on no account clear it.
+            self._restart(self._controller.restart_to_apply_permission)
+            return
+        if not self._permission_prompt_spent:
+            self._ask_macos_once()
+            return
+        self._restart_for_permission()
+
+    def _needs_restart_to_apply(self) -> bool:
+        status = self._permission_status
+        return status is not None and status.needs_restart_to_apply
+
+    def _ask_macos_once(self) -> None:
+        """The one request per process that macOS will actually act on."""
+        self._permission_prompt_spent = True
         try:
             self._controller.request_permission()
         except Exception:  # noqa: BLE001 - a refused prompt is not a crash
             logger.exception("Requesting the blocking permission failed")
         self._refresh_permission_banner()
+
+    def _restart(self, action) -> None:
+        """Run ``action``, then close so the replacement can start."""
+        try:
+            restarting = action()
+        except Exception:  # noqa: BLE001 - a failed restart is not a crash
+            logger.exception("Could not restart")
+            restarting = False
+
+        self._restart_pending = restarting
+        if not restarting:
+            self._set_warning(
+                "This application could not restart itself. Quit it and open "
+                "it again - macOS only settles what it is allowed to do when "
+                "it starts."
+            )
+            self._refresh_permission_banner()
+            return
+        # Closing is what lets the relaunch take effect: the new process only
+        # gets a fresh answer from macOS once this one is gone.
+        QTimer.singleShot(0, self.close)
+
+    def _restart_for_permission(self) -> None:
+        """Clear our own entries and start again, so macOS asks properly."""
+        if not self._controller.can_reset_permissions():
+            # Run from source there is nothing of ours to clear, and the grant
+            # belongs to whatever launched the interpreter anyway.
+            self._set_warning(
+                "macOS will not ask again while this is running from source. "
+                "Quit it, run `make dev`, and grant permission to the "
+                "application that opens."
+            )
+            return
+
+        self._set_status("Restarting so macOS shows its permission prompt again…")
+        self._restart(self._controller.restart_for_permission)
 
     def _on_open_settings(self) -> None:
         QDesktopServices.openUrl(QUrl(self._settings_url))
@@ -743,7 +958,14 @@ class OverlayWindow(QWidget):
 
     # -- collapsing --------------------------------------------------------
     def toggle_collapsed(self, collapsed: bool | None = None) -> None:
-        target = not self._body.isVisible() if collapsed is None else collapsed
+        """Collapse or expand the body; ``None`` means "the other one".
+
+        ``target`` is the collapsed state being asked for, so with no argument
+        it is the state the panel is *not* in - which is what ``isVisible()``
+        already reports, since a visible body is an expanded panel.  Negating
+        it instead reasserts the current state, and the button does nothing.
+        """
+        target = self._body.isVisible() if collapsed is None else collapsed
         self._body.setVisible(not target)
         self.collapse_button.setText("⌄" if target else "⌃")
         self.adjustSize()
@@ -892,15 +1114,45 @@ class OverlayWindow(QWidget):
         self._lock_settings(locked)
 
     def _blocked_reason(self) -> str:
-        """Why Start is unavailable - named precisely enough to be actionable."""
+        """Why Start is unavailable - named precisely enough to be actionable.
+
+        The permission is named from what the probes actually report, not from
+        which check happened to fail first.  Saying "Accessibility" when
+        Accessibility is on and Post Events is the service refusing sends the
+        user to a switch that is already in the right position, and they
+        reasonably conclude the application is lying to them.
+        """
         if self._backend_error:
             return "No keyboard backend is available, so nothing can be typed."
+
         if self._permission_granted is False:
-            return "Accessibility permission is required before typing can start."
+            return (
+                f"macOS has not granted {self._denied_typing_gates()}, so key "
+                "events would be silently discarded."
+            )
         return (
             "Input Monitoring permission is required, because typing is only "
             f"allowed while {config.HOTKEY_ABORT_LABEL} can stop it."
         )
+
+    def _denied_typing_gates(self) -> str:
+        """The permissions that stop a key event being delivered, by name.
+
+        Only the two that decide delivery.  Input Monitoring blocks Start as
+        well, but for a different reason, and it has its own sentence.
+        """
+        status = self._permission_status
+        if status is None:
+            return "Accessibility"
+        denied = [
+            name
+            for name, granted in (
+                ("Accessibility", status.accessibility),
+                ("Post events", status.post_events),
+            )
+            if granted is False
+        ]
+        return " and ".join(denied) if denied else "Accessibility"
 
     def _lock_settings(self, locked: bool) -> None:
         for widget in self._settings_widgets():

@@ -104,7 +104,7 @@ make setup
 ```
 
 ```bash
-make run
+make dev
 ```
 
 `make setup` creates `.venv` and installs everything into it; nothing is installed
@@ -114,12 +114,32 @@ system-wide. Other targets:
 | --- | --- |
 | `make help` | List every target |
 | `make setup` | Create the virtualenv and install the app and dev tools |
-| `make run` | Run the overlay from source |
+| `make dev` | Build and open the development app — use this while working on it |
+| `make run` | Run the overlay straight from source (cannot hold a permission grant) |
 | `make test` | Run the automated test suite |
 | `make app` | Build `dist/Typing Simulator.app` |
 | `make install` | Build the app and copy it to `/Applications` |
+| `make reset-permissions` | Clear stale macOS permission entries for the app |
+| `make reset-dev-permissions` | The same, for the development app |
 | `make clean` | Remove build output and caches |
 | `make distclean` | Also remove the virtualenv |
+
+### Why there is a development app
+
+macOS grants Accessibility to the *running executable*, and neither obvious way to run this gives
+that executable a stable identity. From source it is the virtualenv's interpreter — a symlink to a
+Homebrew Python shared with everything else on the machine, which macOS additionally attributes to
+whichever terminal launched it. `make app` produces a real `.app`, but it is ad-hoc signed, so its
+identity is a hash of its contents and every rebuild invalidates the grant.
+
+`make dev` builds a third thing (see `packaging/dev_bundle.py`): a real `.app` whose main
+executable is a **copy of the interpreter**, with the source tree reached from outside the bundle
+through `PYTHONPATH`. Because the source lives outside, editing it does not change the bundle's
+contents, so the signature — and the permission granted to it — stays put. Grant it once and keep
+editing. Rebuilding takes about a second.
+
+Log output goes to `~/Library/Logs/Typing Simulator/typing-simulator.log` whenever the app runs as
+a bundle, since there is no terminal attached to write to.
 
 Requires Python 3.11 or newer. Override the interpreter with
 `make PYTHON=/path/to/python3.12 setup`. `Ctrl+C` in the launching terminal quits cleanly.
@@ -137,22 +157,41 @@ weaken or bypass a grant.
 > the symptom is not an error — it is *nothing at all happening*.
 >
 > Because that failure is invisible, the overlay checks the permission before every run and
-> refuses to start without it, showing an orange banner with **Request permission**, **Open
-> settings** and **Re-check** buttons. If the banner is showing, no amount of clicking Start
-> will type anything until the permission is granted — that is deliberate.
+> refuses to start without it, showing an orange banner with a per-permission checklist —
+> `✓ Accessibility  ✕ Post events  – Input Monitoring (not needed)` — and the buttons below. If
+> the banner is showing, no amount of clicking Start will type anything until the permission is
+> granted — that is deliberate.
 >
-> **Press "Request permission" first.** The button requests whichever permission the banner
-> currently names. Reading a permission never registers this process with macOS. An entry you
-> added by hand with the **+** button records the app's identity at that moment, so a later
-> rebuild produces a binary the entry no longer matches — the switch stays on and stops
-> working. Requesting makes macOS register the build that is running now.
+> **Press "Grant permission".** One button, because which of the possible actions is needed is a
+> fact about TCC's internals and not something you should have to know.
+>
+> The first press asks macOS. Reading a permission never registers this process with it, and an
+> entry you added by hand with the **+** button records the app's identity at that moment — so a
+> later rebuild produces a binary the entry no longer matches, and the switch stays on while
+> nothing works. Asking properly registers the build that is running now.
+>
+> After that, asking cannot help: macOS settles what a process may do the first time it asks and
+> keeps that answer for as long as the process lives, and shows its dialog at most **once per
+> launch**. So the next press does the only thing that can still work — it clears this
+> application's own entries (scoped to its bundle identifier, never any other application's) and
+> restarts, which is a fresh process with nothing recorded against it and therefore a real
+> prompt. Running from source there is nothing of ours to clear, and the banner says so instead.
+>
+> Nothing is ever cleared while a permission still reads as granted. Clearing exists only to get
+> a prompt back, and a grant that is in force does not need one — so in that case the press
+> restarts and leaves every entry alone.
 
-Two distinct TCC services are involved, both controlled by the single Accessibility switch:
-`kTCCServiceAccessibility` (read via `AXIsProcessTrusted()`) and `kTCCServicePostEvent` (read
-via `CGPreflightPostEventAccess()`), which is the one that actually decides whether
+Three distinct TCC services are involved. Two of them are controlled by the single Accessibility
+switch: `kTCCServiceAccessibility` (read via `AXIsProcessTrusted()`) and `kTCCServicePostEvent`
+(read via `CGPreflightPostEventAccess()`), which is the one that actually decides whether
 `CGEventPost` reaches another application. When those two disagree, the grant is stale rather
 than absent, and the banner says so instead of telling you to enable something you already
 enabled.
+
+That stale state has its own request call, `CGRequestPostEventAccess()`, and it has to: a
+process that is already trusted for Accessibility gets `True` straight back from
+`AXIsProcessTrustedWithOptions` without any prompt at all, so without asking about Post Events
+by name there is nothing the application can do about it from the inside.
 
 **Check every permission from the command line:**
 
@@ -169,8 +208,9 @@ If `accessibility` or `post_events` is `False`:
    the responsible parent process rather than to the Python script. The overlay's banner names
    whichever applies to how you started it.
 3. If it is already listed and enabled, **do not toggle it** — that never fixes anything. The
-   entry itself has gone stale: remove it with the **−** button and let the app ask again
-   (**Request permission** in the banner), or run `make reset-permissions`.
+   entry itself has gone stale: press **Grant permission** again, or run `make reset-permissions`
+   (`make reset-dev-permissions` for the development app), or remove it with the **−** button and
+   let the app ask again.
 4. **Quit that application completely with ⌘Q and reopen it.** This is the step people miss:
    macOS decides a process's trust when it launches, so an already-running terminal keeps the
    old, denied answer no matter what you change in Settings.
@@ -183,12 +223,21 @@ its real path with:
 .venv/bin/python -c "import sys, os; print(os.path.realpath(sys.executable))"
 ```
 
-**Input Monitoring** is a separate permission, used by the global hotkey listener, and enabling
-Accessibility does **not** enable it. A global event monitor installs successfully without it
-and then simply never fires, so the application preflights the permission instead of trusting
-that the monitor was created: without it, the abort hotkey would be dead while appearing to
-work. Typing is refused until it is granted. Use **Request permission** in the banner, or grant
-the same application access under **Privacy & Security → Input Monitoring**, then restart it.
+**Input Monitoring** is a separate permission and enabling Accessibility does **not** enable it.
+Which permission actually gates a global hotkey depends entirely on how the hotkey is
+implemented, so each implementation declares it rather than the caller guessing:
+
+* `NSEventHotkeyService` — the default on macOS — installs `NSEvent` global monitors, which Apple
+  gates on the process being **trusted for accessibility**. It needs no Input Monitoring at all,
+  which is why the checklist shows that row as *not needed* and it never blocks Start.
+* `PynputHotkeyService`, the portable fallback, installs a `CGEventTap`, and
+  `kTCCServiceListenEvent` — Input Monitoring — is exactly what gates that. It preflights the
+  permission there.
+
+The preflight matters either way: a global event monitor installs successfully without the
+permission and then simply never fires, so checking only the return value would report working
+hotkeys while the abort shortcut was dead. Typing is refused until the permission the hotkeys
+actually use is granted.
 
 If permission is missing:
 
@@ -490,7 +539,9 @@ because the entry itself is the problem.
 
 In order:
 
-1. Press **Request permission** in the banner. This registers the build that is running now.
+1. Press **Grant permission** in the banner. This registers the build that is running now, and if
+   asking is no longer possible it clears this application's own entries and restarts so macOS
+   prompts properly.
 2. If the banner is still there, clear the stale entry and relaunch:
 
 ```bash
@@ -501,9 +552,34 @@ make reset-permissions
    Accessibility**, select the row, press **−**, then relaunch the app and accept its prompt.
 
 `make app` now runs `make reset-permissions` for you after every build, so this should not
-recur. The banner distinguishes the two cases: it says permission "is switched on but is not in
-effect for this build" when the grant is stale, and names a missing permission plainly
-otherwise.
+recur. The banner distinguishes the cases: it says permission "is switched on but not in effect
+for this build" when the grant is stale, "is granted, but this run cannot see it yet" when a
+restart is what is needed, and names a missing permission plainly otherwise.
+
+### Why granting it sometimes needs a restart
+
+The three probes do not age the same way, and the difference produces a failure that looks
+exactly like a broken application:
+
+* `AXIsProcessTrusted()` asks macOS afresh every time, so it starts answering `True` the moment
+  you flip the switch.
+* `CGPreflightPostEventAccess()` and `CGPreflightListenEventAccess()` answer from a decision the
+  process was handed when it **started**, and keep answering it for as long as it runs.
+
+So a run launched before the grant watches Accessibility go green while the other two stay red
+for ever, with nothing wrong in System Settings at all. Only a restart changes their minds, and
+the fix for a genuinely stale grant — clearing the entry — would throw away the permission you
+just granted. The overlay tells the two apart and restarts itself when it sees Accessibility
+granted while Post events still reads denied.
+
+That restart happens at most once per attempt, and "per attempt" is the load-bearing part. The
+new process is told, through `TYPING_SIMULATOR_RESTARTED`, *why* it was restarted, and only a
+restart that was already this same refresh suppresses another one. Recording nothing but "we
+restarted" conflates it with the reset-and-restart behind **Grant permission** — and since that
+one is immediately followed by macOS asking you to grant the permission, the grant you then made
+found the single allowance already spent. The banner sat on `✓ Accessibility  ✕ Post events`
+doing nothing until the button was pressed a second time. The marker is dropped as soon as the
+permissions read as working, so a later grant in the same run is picked up too.
 
 Running **from source**, there is a second cause: macOS attributes the permission to the
 application that launched Python — your terminal or IDE — not to the script. The banner names

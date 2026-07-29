@@ -263,29 +263,81 @@ def test_unknown_permission_state_does_not_block(backend) -> None:
     assert controller.state is AppState.ARMING
 
 
-def test_permission_request_asks_for_accessibility_first(backend, monkeypatch) -> None:
-    """Input Monitoring is irrelevant until key events can be delivered."""
+def _record_permission_requests(monkeypatch, status: PermissionStatus) -> list[str]:
+    """Replace every request call so the suite never prompts the real system."""
     calls: list[str] = []
-    status = PermissionStatus(
-        accessibility=False,
-        post_events=False,
-        input_monitoring=False,
+    monkeypatch.setattr(controller_module, "permission_status", lambda: status)
+    for name, label, answer in (
+        ("request_accessibility_permission", "accessibility", status.accessibility),
+        ("request_post_event_permission", "post-events", status.post_events),
+        (
+            "request_input_monitoring_permission",
+            "input-monitoring",
+            status.input_monitoring,
+        ),
+    ):
+        monkeypatch.setattr(
+            controller_module,
+            name,
+            (lambda label=label, answer=answer: calls.append(label) or answer),
+        )
+    return calls
+
+
+def _status(
+    *,
+    accessibility: bool | None = True,
+    post_events: bool | None = True,
+    input_monitoring: bool | None = True,
+) -> PermissionStatus:
+    return PermissionStatus(
+        accessibility=accessibility,
+        post_events=post_events,
+        input_monitoring=input_monitoring,
         subject=PermissionSubject("Typing Simulator", None, True),
     )
-    monkeypatch.setattr(controller_module, "permission_status", lambda: status)
-    monkeypatch.setattr(
-        controller_module,
-        "request_accessibility_permission",
-        lambda: calls.append("accessibility") or False,
-    )
-    monkeypatch.setattr(
-        controller_module,
-        "request_input_monitoring_permission",
-        lambda: calls.append("input-monitoring") or False,
-    )
+
+
+DENIED = _status(accessibility=False, post_events=False, input_monitoring=False)
+
+
+def test_permission_request_asks_for_accessibility_first(backend, monkeypatch) -> None:
+    """Input Monitoring is irrelevant until key events can be delivered."""
+    calls = _record_permission_requests(monkeypatch, DENIED)
 
     controller = build_controller(backend)
     assert controller.request_permission() is False
+    assert calls[0] == "accessibility"
+    assert "input-monitoring" not in calls
+
+
+def test_permission_request_asks_about_post_events_when_that_is_what_is_denied(
+    backend, monkeypatch
+) -> None:
+    """The stale-grant dead end: already trusted, so nothing else prompts.
+
+    ``AXIsProcessTrustedWithOptions`` answers True without showing anything
+    when Accessibility is already granted, so unless Post Events is requested
+    by name this state can never be repaired from inside the application.
+    """
+    calls = _record_permission_requests(
+        monkeypatch, _status(accessibility=True, post_events=False)
+    )
+
+    controller = build_controller(backend)
+    controller.request_permission()
+    assert "post-events" in calls
+
+
+def test_permission_request_leaves_post_events_alone_when_it_is_granted(
+    backend, monkeypatch
+) -> None:
+    calls = _record_permission_requests(
+        monkeypatch, _status(accessibility=False, post_events=True)
+    )
+
+    controller = build_controller(backend)
+    controller.request_permission()
     assert calls == ["accessibility"]
 
 
@@ -293,28 +345,127 @@ def test_permission_request_asks_for_input_monitoring_when_it_blocks_hotkeys(
     backend, monkeypatch
 ) -> None:
     """The banner button must request the permission named in the banner."""
-    calls: list[str] = []
-    status = PermissionStatus(
-        accessibility=True,
-        post_events=True,
-        input_monitoring=False,
-        subject=PermissionSubject("Typing Simulator", None, True),
-    )
-    monkeypatch.setattr(controller_module, "permission_status", lambda: status)
-    monkeypatch.setattr(
-        controller_module,
-        "request_accessibility_permission",
-        lambda: calls.append("accessibility") or False,
-    )
-    monkeypatch.setattr(
-        controller_module,
-        "request_input_monitoring_permission",
-        lambda: calls.append("input-monitoring") or True,
-    )
+    calls = _record_permission_requests(monkeypatch, _status(input_monitoring=False))
 
     controller = build_controller(backend)
-    assert controller.request_permission() is True
+    assert controller.request_permission() is False
     assert calls == ["input-monitoring"]
+
+
+def test_input_monitoring_is_not_requested_when_the_hotkeys_do_not_need_it(
+    backend, monkeypatch
+) -> None:
+    """macOS runs the hotkeys on NSEvent monitors, which Accessibility gates.
+
+    Prompting for Input Monitoring anyway puts a dialog for a permission this
+    build never uses in front of the user, and leaves a red row behind when
+    they decline it.
+    """
+    calls = _record_permission_requests(monkeypatch, _status(input_monitoring=False))
+
+    hotkeys = FakeHotkeyService()
+    hotkeys.requires_input_monitoring = False
+    controller = build_controller(backend, hotkeys=hotkeys)
+    controller.request_permission()
+    assert "input-monitoring" not in calls
+
+
+def _record_restarts(monkeypatch, status: PermissionStatus | None = None) -> list[str]:
+    """Record what a restart did, without touching TCC or launching anything."""
+    calls: list[str] = []
+    if status is not None:
+        monkeypatch.setattr(controller_module, "permission_status", lambda: status)
+    monkeypatch.setattr(
+        controller_module, "reset_permissions", lambda: calls.append("reset") or True
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "relaunch",
+        lambda reason=controller_module.RESTART_TO_APPLY: (
+            calls.append(f"relaunch:{reason}") or True
+        ),
+    )
+    return calls
+
+
+def test_restarting_to_apply_a_grant_never_clears_it(backend, monkeypatch) -> None:
+    """The destructive and non-destructive restarts must not be confused.
+
+    This one runs when the user has just granted the permission and the
+    process is still quoting its start-up answer.  Clearing the entry here
+    would delete exactly what they granted.
+    """
+    calls = _record_restarts(monkeypatch)
+
+    controller = build_controller(backend)
+    assert controller.restart_to_apply_permission() is True
+    assert calls == [f"relaunch:{controller_module.RESTART_TO_APPLY}"]
+
+
+def test_restarting_for_permission_clears_the_entries_first(backend, monkeypatch) -> None:
+    """Order matters and neither half works alone.
+
+    Restarting without clearing leaves the same stale entry in place; clearing
+    without restarting changes nothing the running process can see, because
+    macOS settles a process's answer once and keeps it.
+    """
+    order = _record_restarts(monkeypatch, DENIED)
+
+    controller = build_controller(backend)
+    assert controller.restart_for_permission() is True
+    assert order == ["reset", f"relaunch:{controller_module.RESTART_AFTER_RESET}"]
+
+
+def test_the_reset_restart_says_it_was_a_reset(backend, monkeypatch) -> None:
+    """The next process has to know a restart-to-apply is still owed.
+
+    Marking every restart the same way is what made the automatic one stop
+    happening: the reset spent the single allowance, and the grant the user
+    made a moment later then sat there unread.
+    """
+    order = _record_restarts(monkeypatch, DENIED)
+
+    controller = build_controller(backend)
+    controller.restart_for_permission()
+    assert order[-1] == f"relaunch:{controller_module.RESTART_AFTER_RESET}"
+
+
+@pytest.mark.parametrize(
+    "granted",
+    [
+        {"accessibility": True},
+        {"post_events": True},
+        {"input_monitoring": True},
+    ],
+)
+def test_a_live_grant_is_never_cleared_to_ask_for_it_again(
+    backend, monkeypatch, granted
+) -> None:
+    """Clearing exists to get a prompt back, not to destroy a working grant."""
+    fields = {
+        "accessibility": False,
+        "post_events": False,
+        "input_monitoring": False,
+        **granted,
+    }
+    calls = _record_restarts(monkeypatch, _status(**fields))
+
+    controller = build_controller(backend)
+    assert controller.restart_for_permission() is True
+    assert "reset" not in calls
+    assert calls == [f"relaunch:{controller_module.RESTART_TO_APPLY}"]
+
+
+def test_restarting_reports_failure_when_nothing_can_be_reopened(
+    backend, monkeypatch
+) -> None:
+    """The overlay must not close itself when nothing is coming back."""
+    monkeypatch.setattr(controller_module, "permission_status", lambda: DENIED)
+    monkeypatch.setattr(controller_module, "reset_permissions", lambda: False)
+    monkeypatch.setattr(controller_module, "relaunch", lambda reason=None: False)
+
+    controller = build_controller(backend)
+    assert controller.restart_for_permission() is False
 
 
 def test_hotkeys_are_started_exactly_once(backend) -> None:
@@ -585,8 +736,12 @@ def test_focus_loss_resumes_automatically_when_the_target_returns(backend) -> No
         assert wait_until(lambda: controller.state is AppState.RUNNING), (
             "typing did not resume by itself once the target was frontmost again"
         )
-        assert not controller.scheduler.is_paused
-        assert any("Resumed automatically" in m for m in statuses)
+        # The state changes before the worker wakes, deliberately: resuming the
+        # scheduler first would emit keys while the state still said PAUSED,
+        # and the focus monitor ignores every state but RUNNING.  So this has
+        # to be waited for rather than asserted outright.
+        assert wait_until(lambda: not controller.scheduler.is_paused)
+        assert wait_until(lambda: any("Resumed automatically" in m for m in statuses))
     finally:
         controller.abort()
 
